@@ -1,0 +1,21 @@
+# PhotoVerify AI v5.3
+# Python 3.10-3.12 recommended
+# pip install -r requirements.txt
+
+streamlit>=1.42.0
+google-generativeai>=0.8.4
+google-auth>=2.38.0
+google-auth-oauthlib>=1.2.1
+google-auth-httplib2>=0.2.0
+gspread>=6.1.4
+sentence-transformers>=3.4.1
+faiss-cpu>=1.10.0
+opencv-python-headless>=4.11.0.86
+mediapipe>=0.10.0
+Pillow>=11.1.0
+imagehash>=4.3.2
+numpy>=1.26.0
+scipy>=1.14.0
+pandas>=2.2.3
+requests>=2.32.3
+openpyxl>=3.1.5
