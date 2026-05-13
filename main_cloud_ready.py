@@ -34,6 +34,20 @@
 # All v7 fixes (FIX 1–10) and refactors (REFACTOR 1–5) are retained unchanged.
 # =============================================================================
 
+# =============================================================================
+# STREAMLIT CLOUD BOOTSTRAP — must run before importing streamlit/torch/transformers
+# =============================================================================
+import os
+os.environ.setdefault("STREAMLIT_SERVER_FILE_WATCHER_TYPE", "none")
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
+os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
+os.environ.setdefault("TRANSFORMERS_NO_ADVISORY_WARNINGS", "1")
+PV_CLOUD_MODE = bool(os.getenv("PV_CLOUD_MODE", "")) or os.path.exists("/mount/src")
+
 import streamlit as st
 import sqlite3, hashlib, cv2, numpy as np, pandas as pd, faiss
 import httpx, io, os, json, time, uuid, threading, logging, shutil
@@ -57,7 +71,7 @@ import scipy.fftpack
 import google.generativeai as genai
 from google.oauth2.service_account import Credentials
 import gspread
-from sentence_transformers import SentenceTransformer
+# SentenceTransformer is imported lazily in load_clip() to keep Cloud startup light.
 
 warnings.filterwarnings("ignore")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -106,7 +120,7 @@ def _ss_lock(name: str, fallback):
 # CONSTANTS
 # =============================================================================
 APP_NAME    = "Sridhar's PhotoVerify AI"
-APP_VERSION = "V8-Fast40-Cloud-ProMetrics-GuideFix"
+APP_VERSION = "V8-CloudSafe-SameAccuracy"
 DB_NAME     = "photoverify.db"
 FAISS_INDEX = "faiss.bin"
 FAISS_TMP   = "faiss.bin.tmp"
@@ -196,14 +210,14 @@ BRANDING_KEYWORDS  = [
 # PARALLEL_CHUNKS=2 runs two chunks concurrently in background threads, hiding
 # the chunk-boundary UI-rerender pause and saturating Gemini quota headroom.
 # Net effect: ~3–4× throughput gain over v7 baseline.
-CHUNK_SIZE           = 40   # Fast40: one 40-worker executor per UI cycle
-PARALLEL_CHUNKS      = 1    # Fast40: avoid nested 2-chunk overhead; still 40 concurrent workers
+CHUNK_SIZE           = int(os.getenv("PV_CHUNK_SIZE", "12" if PV_CLOUD_MODE else "40"))  # Cloud-safe default; local keeps V8 Fast40
+PARALLEL_CHUNKS      = int(os.getenv("PV_PARALLEL_CHUNKS", "1"))
 FAISS_FLUSH          = 500
 RETRY_DB             = 5
 RETRY_IMG            = 2
 RETRY_AI             = 3
 HTTP_TIMEOUT         = 15
-AI_TIMEOUT_S         = 20
+AI_TIMEOUT_S         = int(os.getenv("PV_AI_TIMEOUT_S", "35" if PV_CLOUD_MODE else "20"))
 HTTP_CONNECT_TIMEOUT = 8
 HTTP_HARD_TIMEOUT_S  = 30
 MAX_IMAGE_BYTES      = 20 * 1024 * 1024
@@ -212,6 +226,13 @@ CLIP_MAX_SIDE        = 512      # restored: 384 lost too much semantic detail
 AI_MAX_SIDE          = 1024     # restored: 896 caused Pro to miss fine detail
 AI_JPEG_QUALITY      = 75       # restored: 65 was too lossy for Pro to read detail
 FACE_SIM_VETO_T = 0.55  # v10.6: from v10.5 duplicate profile
+
+# Streamlit Community Cloud is resource constrained. Keep the exact V8 decision
+# logic, but throttle Gemini calls to prevent worker resets during Pro calls.
+AI_FLASH_CONCURRENCY = int(os.getenv("PV_FLASH_CONCURRENCY", "6" if PV_CLOUD_MODE else "40"))
+AI_PRO_CONCURRENCY   = int(os.getenv("PV_PRO_CONCURRENCY",   "1" if PV_CLOUD_MODE else "4"))
+_AI_FLASH_SEM = threading.BoundedSemaphore(max(1, AI_FLASH_CONCURRENCY))
+_AI_PRO_SEM   = threading.BoundedSemaphore(max(1, AI_PRO_CONCURRENCY))
 
 # =============================================================================
 # STRATEGY PATTERN — Layer Pipeline
@@ -596,35 +617,6 @@ class FlashLayer(BaseLayer):
             return {"exit": False, "skip": True}
 
 
-def _derive_recommendation_from_ai(ai_result: dict, branding_required: bool = BRANDING_REQUIRED) -> Tuple[str, str]:
-    """Convert Pro structured fields into a final Valid/Invalid verdict."""
-    if not ai_result:
-        return "", "No AI result to derive from."
-
-    rec = str(ai_result.get("recommendation", "")).strip().lower()
-    if rec in ("valid", "approved", "pass", "accepted"):
-        return "Valid", "Pro recommendation normalized to Valid."
-    if rec in ("invalid", "reject", "rejected", "fail", "failed"):
-        return "Invalid", "Pro recommendation normalized to Invalid."
-
-    is_screen = bool(ai_result.get("is_screenshot", False))
-    is_manip = bool(ai_result.get("is_manipulated", False))
-    has_face = bool(ai_result.get("has_face", False))
-    has_branding = bool(ai_result.get("has_required_branding", False))
-    child_only = bool(ai_result.get("child_only", False))
-    minor_holding = bool(ai_result.get("minor_holding_branding", False))
-
-    if is_screen or is_manip:
-        return "Invalid", "Derived from Pro fields: screen/photo-of-photo/manipulation detected."
-    if child_only or minor_holding:
-        return "Invalid", "Derived from Pro fields: child-only or minor holding branding."
-    if not has_face:
-        return "Invalid", "Derived from Pro fields: no clearly visible live human face."
-    if branding_required and not has_branding:
-        return "Invalid", "Derived from Pro fields: required branding not visible."
-    return "Valid", "Derived from Pro fields: live face + required branding + no hard invalid signal."
-
-
 class ProLayer(BaseLayer):
     """Layer 5 — Gemini Pro AI for borderline / uncertain cases.
     Graceful degradation: if Pro fails, falls back to Flash verdict or CV score.
@@ -722,13 +714,6 @@ class ProLayer(BaseLayer):
                 pro_r = gemini_pro(ctx.img, flash_r, cv) if cv else gemini_pro(ctx.img, flash_r, CVR())
 
             if pro_r and "error" not in pro_r:
-                # Normalize/derive Pro's final verdict from its own structured fields.
-                derived_rec, derived_reason = _derive_recommendation_from_ai(pro_r)
-                if derived_rec:
-                    pro_r["recommendation"] = derived_rec
-                    if derived_reason and derived_reason not in str(pro_r.get("reasoning", "")):
-                        pro_r["reasoning"] = (str(pro_r.get("reasoning", "")).strip() + " " + derived_reason).strip()
-
                 p_usage = pro_r.get("_usage", {})
                 r.pro_model         = PRO_MODEL
                 r.pro_prompt_tokens = int(p_usage.get("prompt_tokens", 0) or 0)
@@ -776,22 +761,24 @@ class ProLayer(BaseLayer):
                     with _ss_lock("state_lock", _PV_GLOBAL_STATE_LOCK):
                         st.session_state.layer_counts[2] += 1
                 else:
-                    # Pro was needed, but did not return usable JSON. This is still an
-                    # L5 outcome for reporting, because the Pro layer was invoked.
-                    r.pro_model = r.pro_model or PRO_MODEL
+                    # V8 Fast40 correction: if Pro is unavailable/inconclusive but Flash
+                    # has the core VALID signals (live face + required branding) and CV has
+                    # no blocking forensic evidence, do not default a genuine field photo to
+                    # Invalid. This only applies when hard invalid signals are absent.
                     if flash_core_valid and not flash_minor_block and not cv_blocking:
-                        r.validation_status = "Valid"; r.exit_layer = 5
+                        r.validation_status = "Valid"; r.exit_layer = 4
                         r.ai_confidence = round(max(flash_conf, FLASH_FALLBACK_T) * 100, 1)
                         r.error_reason = ""
                         r.forensic_reasoning = (
                             r.forensic_reasoning or
-                            "Pro returned no usable verdict; accepted Flash positive core signals (face + branding) with no blocking CV flags."
+                            "Pro inconclusive; accepted Flash positive core signals (face + branding) with no blocking CV flags."
                         )
                         r = _apply_hard_gates(r)
                         with _ss_lock("state_lock", _PV_GLOBAL_STATE_LOCK):
-                            st.session_state.layer_counts[5] += 1
+                            st.session_state.layer_counts[4] += 1
                     else:
                         r.validation_status = "Invalid"; r.exit_layer = 5
+                        r.pro_model = r.pro_model or PRO_MODEL
                         r.error_reason      = "Flash and Pro inconclusive; defaulting to Invalid by production policy"
                         r.forensic_reasoning = "Flash failed or was inconclusive, and Pro did not return a usable verdict."
                         with _ss_lock("state_lock", _PV_GLOBAL_STATE_LOCK):
@@ -1254,24 +1241,70 @@ def _find_sa():
                 pass
     return None, None
 
+def _secret_to_plain_dict(obj):
+    """Convert st.secrets AttrDict/nested values to a normal JSON-like dict."""
+    try:
+        obj = dict(obj)
+    except Exception:
+        return obj
+    out = {}
+    for k, v in obj.items():
+        if hasattr(v, "items"):
+            out[k] = _secret_to_plain_dict(v)
+        else:
+            out[k] = v
+    return out
+
+
+def _normalize_service_account_info(info: dict) -> dict:
+    """Fix common Streamlit TOML private_key formatting issues."""
+    info = _secret_to_plain_dict(info or {})
+    if not isinstance(info, dict):
+        return {}
+    pk = info.get("private_key", "")
+    if pk:
+        pk = str(pk).strip().strip('"').strip("'")
+        pk = pk.replace("\\n", chr(10))
+        pk = pk.replace("-----BEGIN_PRIVATE_KEY-----", "-----BEGIN PRIVATE KEY-----")
+        pk = pk.replace("-----END_PRIVATE_KEY-----", "-----END PRIVATE KEY-----")
+        pk = pk.replace("-----BEGIN PRIVATE_KEY-----", "-----BEGIN PRIVATE KEY-----")
+        pk = pk.replace("-----END PRIVATE_KEY-----", "-----END PRIVATE KEY-----")
+        if "-----BEGIN PRIVATE KEY-----" in pk and chr(10) not in pk:
+            pk = pk.replace("-----BEGIN PRIVATE KEY-----", "-----BEGIN PRIVATE KEY-----" + chr(10))
+            pk = pk.replace("-----END PRIVATE KEY-----", chr(10) + "-----END PRIVATE KEY-----" + chr(10))
+        info["private_key"] = pk
+    return info
+
+
+def _load_service_account_from_secrets():
+    """Load service account from Streamlit Cloud secrets.
+
+    Supported formats:
+    1) [gcp_service_account] table with JSON fields
+    2) GOOGLE_SERVICE_ACCOUNT_JSON = '{...}'
+    """
+    try:
+        if "gcp_service_account" in st.secrets:
+            return "streamlit_secrets:gcp_service_account", _normalize_service_account_info(st.secrets["gcp_service_account"])
+        if "GOOGLE_SERVICE_ACCOUNT_JSON" in st.secrets:
+            raw = st.secrets["GOOGLE_SERVICE_ACCOUNT_JSON"]
+            return "streamlit_secrets:GOOGLE_SERVICE_ACCOUNT_JSON", _normalize_service_account_info(json.loads(raw))
+    except Exception as e:
+        logging.error(f"Secrets parse error: {e}")
+    return "", None
+
+
 def auto_auth():
     if st.session_state.gemini_ok:
         return True
 
-    info = None
-    path = "streamlit_secrets"
-    
-    try:
-        if "gcp_service_account" in st.secrets:
-            info = dict(st.secrets["gcp_service_account"])
-    except Exception:
-        pass
-        
+    path, info = _load_service_account_from_secrets()
     if not info:
         path, info = _find_sa()
-
     if not info:
         return False
+
+    info = _normalize_service_account_info(info)
     try:
         gcreds = Credentials.from_service_account_info(info, scopes=[
             "https://www.googleapis.com/auth/cloud-platform",
@@ -1288,6 +1321,7 @@ def auto_auth():
         return True
     except Exception as e:
         logging.error(f"Auth: {e}")
+        st.session_state.gemini_ok = False
         return False
 
 # =============================================================================
@@ -1676,6 +1710,8 @@ def faiss_search(idx, emb, k=1):
 # =============================================================================
 @st.cache_resource(show_spinner=False)
 def load_clip():
+    # Lazy import: avoids loading torch/transformers during Streamlit health check.
+    from sentence_transformers import SentenceTransformer
     return SentenceTransformer("clip-ViT-B-32")
 
 def embed(model, img): return model.encode(img, show_progress_bar=False)
@@ -2302,8 +2338,9 @@ def gemini_flash(img):
     payload = [{"mime_type": "image/jpeg", "data": encode_ai_image(img)}]
     for attempt in range(RETRY_AI):
         try:
-            model = get_gemini_model(FLASH_MODEL)
-            resp  = _generate_json(model, payload, 256)
+            with _AI_FLASH_SEM:
+                model = get_gemini_model(FLASH_MODEL)
+                resp  = _generate_json(model, payload, 256)
             r     = _parse_json(_resp_text(resp))
             if r:
                 usage = _extract_usage(resp)
@@ -2327,8 +2364,9 @@ def gemini_pro(img, flash_r, cv):
     payload = [prompt, {"mime_type":"image/jpeg","data":encode_ai_image(img)}]
     for attempt in range(RETRY_AI):
         try:
-            model = get_gemini_model(PRO_MODEL)
-            resp  = _generate_json(model, payload, 512)
+            with _AI_PRO_SEM:
+                model = get_gemini_model(PRO_MODEL)
+                resp  = _generate_json(model, payload, 512)
             r     = _parse_json(_resp_text(resp))
             if r:
                 usage = _extract_usage(resp)
@@ -2537,6 +2575,9 @@ def compute_layer_counts_from_results(results):
     return counts
 
 def start_batch(sources, df=None, url_col=None):
+    if st.session_state.clip_model is None:
+        with st.spinner("Loading duplicate-detection model (first run can take ~30s on Cloud)…"):
+            st.session_state.clip_model = load_clip()
     st.session_state.chunk_state = {
         "sources": sources, "df": df, "url_col": url_col,
         "idx": 0, "results": [], "t_start": time.time(), "running": True}
@@ -2596,7 +2637,7 @@ def _run_one_chunk_bg(state, start_idx, end_idx, out_list, _ctx):
                 st.session_state.processed_count = len(state["results"]) + len(out_list)
 
 
-def run_chunk(bar, status, metrics=None, layers=None, recent=None):
+def run_chunk(bar, status, metrics, layers, recent):
     """
     v8 SPEED — Pipelined multi-chunk dispatcher.
 
@@ -2682,13 +2723,11 @@ def run_chunk(bar, status, metrics=None, layers=None, recent=None):
         if r.exit_layer in layer_counts:
             layer_counts[r.exit_layer] += 1
 
-    if metrics is not None:
-        metrics.markdown(
-            f"| ✅ Valid | ❌ Invalid | 🔁 Duplicate | ⚠️ Error |\n"
-            f"|:---:|:---:|:---:|:---:|\n"
-            f"| **{v}** | **{inv}** | **{d}** | **{er}** |")
-    if layers is not None:
-        layers.markdown(f"""
+    metrics.markdown(
+        f"| ✅ Valid | ❌ Invalid | 🔁 Duplicate | ⚠️ Error |\n"
+        f"|:---:|:---:|:---:|:---:|\n"
+        f"| **{v}** | **{inv}** | **{d}** | **{er}** |")
+    layers.markdown(f"""
 | Layer | Count |
 |---|---:|
 | L1 Hash | {layer_counts[1]} |
@@ -2710,7 +2749,7 @@ def run_chunk(bar, status, metrics=None, layers=None, recent=None):
             "Tokens": r.total_ai_tokens,
             "ms":     r.processing_time_ms,
         })
-    if rows and recent is not None: recent.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+    if rows: recent.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
 
     time.sleep(0.05)
     try: st.rerun()
@@ -2824,14 +2863,6 @@ def build_output_df(results, orig_df=None):
             "PV_Error_Reason":          r.error_reason,
             "PV_Flash_Model":           r.flash_model,
             "PV_Pro_Model":             r.pro_model,
-            "PV_Pro_Attempted":         bool(r.pro_model),
-            "PV_AI_Decision_Source":    (
-                "Pro / L5" if r.exit_layer == 5 else
-                "Flash / L4" if r.exit_layer == 4 else
-                "Duplicate / L1-L3" if r.validation_status == "Duplicate" else
-                "CV / Pre-AI" if r.exit_layer == 2 else
-                "Hash" if r.exit_layer == 1 else "Other"
-            ),
             "PV_Flash_Total_Tokens":    r.flash_total_tokens,
             "PV_Flash_Cost_INR":        r.flash_cost_inr,
             "PV_Pro_Total_Tokens":      r.pro_total_tokens,
@@ -2886,11 +2917,11 @@ def sidebar():
         # Cost summary
 
         if st.session_state.is_processing:
-            if st.button("⏹ Stop Processing", use_container_width=True):
+            if st.button("⏹ Stop Processing", width="stretch"):
                 cancel_batch(); st.rerun()
             st.divider()
 
-        if st.button("🗑 Clear All Data", use_container_width=True, type="secondary"):
+        if st.button("🗑 Clear All Data", width="stretch", type="secondary"):
             clear_db()
             st.session_state.results          = []
             st.session_state.hash_cache       = {}
@@ -2913,7 +2944,7 @@ def sidebar():
 # SHARED COLUMN SELECTOR + RUN
 # =============================================================================
 def _column_selector_and_run(df, source_label=""):
-    st.dataframe(df.head(5), use_container_width=True)
+    st.dataframe(df.head(5), width="stretch")
     ca, cb = st.columns(2)
     with ca:
         url_col = st.selectbox(
@@ -2926,7 +2957,7 @@ def _column_selector_and_run(df, source_label=""):
     skip_empty = st.checkbox("Skip rows with empty / non-URL values", value=True,
                              key=f"skip_{source_label}")
     st.markdown("---")
-    if st.button(f"🚀 Start Processing", type="primary", use_container_width=True,
+    if st.button(f"🚀 Start Processing", type="primary", width="stretch",
                  key=f"run_{source_label}"):
         work = df.copy()
         if n_limit > 0: work = work.head(n_limit)
@@ -2946,10 +2977,10 @@ def tab_process():
     if not st.session_state.gemini_ok:
         st.error("❌ **Service account not found.**")
         st.markdown("""
-For local testing, place `service_account.json` next to `main.py`. For Streamlit Cloud, add credentials in App Settings → Secrets as `[gcp_service_account]`.
+Place your `service_account.json` in the same folder as `main_v9.py`, then restart.
 ```bash
 ls *.json          # should list your service_account.json
-streamlit run main.py
+streamlit run main_v9.py
 ```
 The JSON must have `"type": "service_account"` with access to:
 - **Google Generative Language API** (Gemini)
@@ -2958,10 +2989,18 @@ The JSON must have `"type": "service_account"` with access to:
         st.stop()
 
     if st.session_state.is_processing and st.session_state.chunk_state is not None:
-        st.markdown("### ⚡ Processing batch")
-        bar = st.progress(0)
-        status = st.empty()
-        run_chunk(bar, status)
+        st.markdown('<div class="live-box">', unsafe_allow_html=True)
+        st.markdown("### ⚡ Live Processing Dashboard")
+        bar      = st.progress(0)
+        status   = st.empty()
+        st.markdown("**Layer exits**")
+        layers   = st.empty()
+        st.markdown("**Running counts**")
+        metrics  = st.empty()
+        st.markdown("**Last 8 processed**")
+        recent   = st.empty()
+        st.markdown("</div>", unsafe_allow_html=True)
+        run_chunk(bar, status, metrics, layers, recent)
         return
 
     inp = st.tabs(["📊 Google Sheet", "📁 CSV / Excel", "🖼️ Upload Images", "🔗 URL List"])
@@ -2973,7 +3012,7 @@ The JSON must have `"type": "service_account"` with access to:
                 placeholder="https://docs.google.com/spreadsheets/d/YOUR_ID/edit")
         with c2:
             st.markdown("<br>", unsafe_allow_html=True)
-            if st.button("Load Sheet", use_container_width=True) and url:
+            if st.button("Load Sheet", width="stretch") and url:
                 with st.spinner("Loading…"):
                     df, sid = load_sheet(url)
                 if df is not None:
@@ -3053,19 +3092,6 @@ def tab_results():
     st.bar_chart(pd.DataFrame({
         "Layer":["L1 Hash","L2 CV","L3 CLIP/ORB","L4 Flash","L5 Pro"],
         "Count":[lc[1],lc[2],lc[3],lc[4],lc[5]]}).set_index("Layer"))
-
-    pro_attempted = sum(1 for r in results if bool(r.pro_model))
-    pro_json = sum(1 for r in results if bool(r.pro_model) and int(r.pro_total_tokens or 0) > 0)
-    pro_no_json = sum(1 for r in results if bool(r.pro_model) and int(r.pro_total_tokens or 0) == 0)
-    pro_valid = sum(1 for r in results if r.exit_layer == 5 and r.validation_status == "Valid")
-    pro_invalid = sum(1 for r in results if r.exit_layer == 5 and r.validation_status in ("Invalid", "Pending Review"))
-    st.markdown("**AI routing / Pro usage**")
-    pa, pb, pc, pd_, pe = st.columns(5)
-    pa.metric("Pro attempted", pro_attempted)
-    pb.metric("Pro JSON returned", pro_json)
-    pc.metric("Pro no usable JSON", pro_no_json)
-    pd_.metric("L5 Valid", pro_valid)
-    pe.metric("L5 Invalid", pro_invalid)
     st.divider()
 
     pv_show = [
@@ -3073,8 +3099,7 @@ def tab_results():
         "PV_Matched_Image_ID","PV_Original_Status",
         "PV_Similarity_Score_%","PV_Exit_Layer",
         "PV_Has_Face","PV_Is_Screenshot","PV_Is_Manipulated",
-        "PV_AI_Confidence_%","PV_AI_Decision_Source","PV_Pro_Attempted",
-        "PV_GPS_Valid","PV_Error_Reason","PV_Processing_Time_ms"
+        "PV_AI_Confidence_%","PV_GPS_Valid","PV_Error_Reason","PV_Processing_Time_ms"
     ]
     avail = [c for c in pv_show if c in df_out.columns]
 
@@ -3095,11 +3120,11 @@ def tab_results():
     if preview_mode == "Validation summary":
         st.dataframe(
             df_out[avail].style.map(color_status, subset=["PV_Validation_Status"]),
-            use_container_width=True, height=360)
+            width="stretch", height=360)
     else:
         st.dataframe(
             df_out.style.map(color_status, subset=["PV_Validation_Status"]),
-            use_container_width=True, height=420)
+            width="stretch", height=420)
 
     st.divider()
     st.markdown("### 📥 Export Results")
@@ -3114,23 +3139,23 @@ def tab_results():
     ea, eb, ec, ed = st.columns(4)
     ea.download_button("⬇️ Full CSV", df_out.to_csv(index=False),
         file_name=f"pv_full_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
-        mime="text/csv", use_container_width=True)
+        mime="text/csv", width="stretch")
     if not inv_df.empty:
         eb.download_button("⬇️ Invalid Only", inv_df.to_csv(index=False),
-            file_name="pv_invalid.csv", mime="text/csv", use_container_width=True)
+            file_name="pv_invalid.csv", mime="text/csv", width="stretch")
     else:
-        eb.button("Invalid Only (0)", disabled=True, use_container_width=True)
+        eb.button("Invalid Only (0)", disabled=True, width="stretch")
     if not dup_df.empty:
         ec.download_button("⬇️ Duplicates", dup_df.to_csv(index=False),
-            file_name="pv_duplicates.csv", mime="text/csv", use_container_width=True)
+            file_name="pv_duplicates.csv", mime="text/csv", width="stretch")
     else:
-        ec.button("Duplicates (0)", disabled=True, use_container_width=True)
+        ec.button("Duplicates (0)", disabled=True, width="stretch")
     if crows:
         ed.download_button("⬇️ Cluster Report",
             pd.DataFrame(crows).sort_values("Cluster_ID").to_csv(index=False),
-            file_name="pv_clusters.csv", mime="text/csv", use_container_width=True)
+            file_name="pv_clusters.csv", mime="text/csv", width="stretch")
     else:
-        ed.button("Clusters (0)", disabled=True, use_container_width=True)
+        ed.button("Clusters (0)", disabled=True, width="stretch")
 
     st.markdown("---")
     fa, fb, fc = st.columns(3)
@@ -3150,14 +3175,14 @@ def tab_results():
     fa.download_button("⬇️ Full Excel (.xlsx)", buf.getvalue(),
         file_name=f"pv_results_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        use_container_width=True)
+        width="stretch")
     json_bytes = df_out.to_json(orient="records", indent=2).encode("utf-8")
     fb.download_button("⬇️ Export JSON", json_bytes,
         file_name=f"pv_results_{datetime.now().strftime('%Y%m%d_%H%M')}.json",
-        mime="application/json", use_container_width=True)
+        mime="application/json", width="stretch")
 
     if st.session_state.sheets_client and st.session_state.loaded_sheet_id:
-        if fc.button("📤 Push to Google Sheet", type="primary", use_container_width=True):
+        if fc.button("📤 Push to Google Sheet", type="primary", width="stretch"):
             with st.spinner("Pushing…"):
                 if push_to_sheet(st.session_state.loaded_sheet_id, results,
                                  st.session_state.current_df):
@@ -3179,57 +3204,112 @@ def tab_results():
 # =============================================================================
 def tab_guide():
     st.markdown(f"""
-### 📘 PhotoVerify AI — User Guide
+<div class="section-card">
 
-#### What this app does
-PhotoVerify AI verifies door-to-door field survey photos and classifies each image as:
+## 📘 PhotoVerify AI — User Guide
 
-- ✅ **Valid** — live adult/person is visible, required political/scheme branding is visible, and no hard invalid signal is found.
-- ❌ **Invalid** — rejected because of missing face, missing branding, screen/photo-of-photo, manipulation, minor-policy issue, or strong CV/AI invalid signal.
-- 🔁 **Duplicate** — same or near-identical image found in the current batch or recent history.
+### What does this app do?
 
-#### Current processing flow
-1. **L1 Hash duplicate check** — exact/perceptual duplicate detection.
-2. **L2 CV / Pre-AI** — screenshot/photo-of-photo/manipulation signals, face count, blur, ELA, bezel, moire, metadata.
-3. **L3 CLIP / ORB duplicate check** — semantic and visual near-duplicate detection using FAISS + ORB.
-4. **L4 Gemini Flash** — fast AI decision for most images.
-5. **L5 Gemini Pro** — called for uncertain/borderline cases. Pro must return **Valid** or **Invalid**. If Pro returns structured fields but no clean recommendation, the app derives the final decision from Pro's own fields. If Pro returns no usable JSON, the app uses a safe Flash fallback only when Flash has strong positive core signals and CV has no blocking evidence.
+PhotoVerify AI automatically verifies field survey photos submitted by door-to-door workers.
+Each photo is classified into one of three outcomes:
 
-#### Valid photo rules
-- Real live person/adult is clearly visible.
-- Required political/scheme branding is visible — for example NCP/clock symbol, Majhi Ladki Bahin material, party flyer, banner, pamphlet, or scheme brochure.
-- The photo is a real field photo, not a phone/laptop/TV screen photo and not a printed-photo capture.
-- Camera timestamp watermark is allowed.
-- Mother/adult with child is valid when the adult is clearly holding or presenting the branding.
+| Result | Meaning |
+|--------|---------|
+| ✅ **Valid** | Live adult present, political/scheme branding visible, not a duplicate |
+| ❌ **Invalid** | Rejected — see the reason in PV_Error_Reason column |
+| 🔁 **Duplicate** | Same or near-identical photo already seen in this batch or last {DUP_LOOKBACK_DAYS} days |
 
-#### Invalid photo rules
-- No clearly visible live human face.
-- Required branding is missing.
-- Photo is from a screen or printed photograph.
-- Digital manipulation, cloning, splicing, or reflection-based capture.
-- Child-only photo or minor holding branding.
-- Strong CV/AI forensic evidence of screenshot/photo-of-photo/manipulation.
+---
 
-#### Understanding Pro and layer distribution
-- **PV_Exit_Layer = 4** means Flash made the final decision.
-- **PV_Exit_Layer = 5** means Pro was needed or attempted.
-- **PV_Pro_Attempted** shows whether Pro was called.
-- **PV_AI_Decision_Source** explains whether the final decision came from Flash, Pro/L5, CV, or duplicate layers.
-- If Pro returns no usable JSON but Flash+CV are safely positive, the image may still be Valid, but it is counted under L5 for transparency.
+### What makes a photo Invalid?
 
-#### Processing UI
-During processing, the app intentionally shows only a clean progress bar and status line:
+A photo is rejected (Invalid) for any of the following reasons:
 
-`completed / total · images/sec · ETA`
+- **No live human face** — the photo must show a real person, not a poster or printout
+- **No political/scheme branding** — NCP clock symbol, Majhi Ladki Bahin materials, party banners/flyers must be visible
+- **Photo of a screen** — taking a picture of a phone/laptop/TV screen instead of a real photo
+- **Printed photo** — photographing a printout or an existing photo instead of a live scene
+- **Children/minors only** — photo contains only people under 18 with no adult present
+- **Child holding branding** — a minor is the one holding the pamphlet/flyer (even if an adult is also in frame)
+- **Mirror/glass reflection** — reflection of a person is not a genuine field photo
+- **Duplicate** — same scene photographed multiple times or near-duplicate found in recent history
 
-Detailed layer counts and Pro metrics are shown after processing in the **Results** tab.
+---
 
-#### Deployment notes for Streamlit Community Cloud
-- Keep `main.py`, `requirements.txt`, `runtime.txt`, and `.streamlit/config.toml` in the GitHub repo.
-- Do **not** commit service account JSON files. Add Google credentials in Streamlit Cloud **Secrets** as `[gcp_service_account]`.
-- Keep `packages.txt` empty or delete it unless a real apt package is required. This app uses `opencv-python-headless`, so apt OpenCV/GLib packages are not required.
-""")
+### What counts as Valid?
 
+- A real adult (18+) is clearly present in the photo
+- NCP Ajit Pawar branding, Majhi Ladki Bahin scheme materials, or political party flyers/posters are visible
+- The adult is holding or near the branding materials
+- **Mother + child is Valid** — when the mother/adult is clearly holding the pamphlet, the photo is valid even if a child is also in the frame
+- Camera app timestamp watermarks are expected and do not affect validity
+
+---
+
+### How to use the app
+
+**Step 1 — Load your data**
+- Go to the **⚡ Process** tab
+- Choose: Google Sheet, CSV/Excel upload, image file upload, or URL list
+- Select the column that contains the image URLs
+
+**Step 2 — Start processing**
+- Click **🚀 Start Processing**
+- Watch the live dashboard: progress bar, layer counts, running totals
+
+**Step 3 — Review results**
+- Go to the **📊 Results** tab
+- Check `PV_Error_Reason` to understand why any photo was rejected
+- Check `PV_Matched_Image_ID` to see which photo a duplicate matched
+
+**Step 4 — Export**
+- Download Full CSV, Invalid-only CSV, Duplicates CSV, or Excel
+- Or push directly back to your Google Sheet
+
+---
+
+### Understanding the output columns
+
+| Column | What it means |
+|--------|--------------|
+| `PV_Validation_Status` | Valid / Invalid / Duplicate |
+| `PV_Error_Reason` | Why the photo was rejected |
+| `PV_Exit_Layer` | Which check caught the issue (L1=hash, L2=CV, L3=CLIP, L4=Flash AI, L5=Pro AI) |
+| `PV_AI_Confidence_%` | How confident the AI was in its decision |
+| `PV_Matched_Image_ID` | ID of the original photo this was a duplicate of |
+| `PV_Processed_At` | UTC timestamp when this photo was processed |
+| `PV_Flash_Cost_INR` | AI cost for the Flash model check |
+| `PV_Pro_Cost_INR` | AI cost for the Pro model check (only for hard cases) |
+
+---
+
+### Duplicate detection — how it works
+
+Duplicates are searched in two places:
+1. **Current batch** — all images being processed right now
+2. **Last {DUP_LOOKBACK_DAYS} days** — photos processed in the past {DUP_LOOKBACK_DAYS} days from the database
+
+> **Why does the FAISS vector count seem higher than the number of valid photos?**
+> FAISS stores embeddings for ALL processed images — valid, invalid, and duplicates.
+> This is necessary so that future submissions of already-rejected photos are also caught as duplicates.
+> The vector count will always be ≥ total photos processed, not just valid ones.
+
+---
+
+### Speed and capacity
+
+- Processes **{CHUNK_SIZE} images in parallel** per chunk, **{PARALLEL_CHUNKS} chunks simultaneously** (v8)
+- Typical throughput: **50–80 images/minute** depending on network and AI response time (was 15–25 in v7)
+- For 20,000 images: expect **~40–60 minutes** at target throughput
+- Gemini Flash model (`{FLASH_MODEL}`) handles most photos
+- Pro model (`{PRO_MODEL}`) is only called for uncertain/borderline cases (~10–15%)
+
+</div>
+""", unsafe_allow_html=True)
+
+# =============================================================================
+# MAIN
+# =============================================================================
 def main():
     st.set_page_config(page_title=APP_NAME, page_icon="🔍",
                        layout="wide", initial_sidebar_state="expanded")
@@ -3238,10 +3318,6 @@ def main():
     init_ss()
     init_db()
     auto_auth()
-
-    if st.session_state.clip_model is None:
-        with st.spinner("Loading CLIP model (first run ~30s)…"):
-            st.session_state.clip_model = load_clip()
 
     if st.session_state.faiss_index is None:
         st.session_state.faiss_index  = faiss_load()
