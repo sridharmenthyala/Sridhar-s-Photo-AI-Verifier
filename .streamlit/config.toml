@@ -1,5 +1,6 @@
 [server]
 fileWatcherType = "none"
+headless = true
 
 [runner]
 fastReruns = true
